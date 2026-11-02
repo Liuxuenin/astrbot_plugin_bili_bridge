@@ -1,4 +1,4 @@
-"""B站动态记忆桥（AstrBot 插件）。
+﻿"""B站动态记忆桥（AstrBot 插件）。
 
 把「B站 那一侧每天挑了什么」变成 QQ 里这个 AI 的真实记忆，并且在她被追问细节时
 去拉字幕讲解，而不是照抄摘要。
@@ -34,8 +34,13 @@ from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.provider import ProviderRequest
 from astrbot.api.star import Context, Star, StarTools, register
 
+try:  # TextPart 在 AstrBot 4.17+ 的位置；拿不到就退化成纯工具模式
+    from astrbot.core.agent.message import TextPart  # type: ignore
+except Exception:  # noqa: BLE001
+    TextPart = None  # type: ignore[assignment]
+
 PLUGIN_NAME = "astrbot_plugin_bili_bridge"
-PLUGIN_VERSION = "0.1.0"
+PLUGIN_VERSION = "0.1.1"
 
 MEMORY_PLUGIN_NAME = "astrbot_plugin_memory_companion"
 
@@ -533,7 +538,17 @@ class BiliBridgePlugin(Star):
     # ── 处理器 2：请求前注入素材 ────────────────────────────────────────────
     @filter.on_llm_request()
     async def inject_material(self, event: AstrMessageEvent, req: ProviderRequest):
+        """用户直接发来视频链接/卡片时，先把素材挂到这次请求上。
+
+        ⚠️ 只走 `req.extra_user_content_parts`，**绝不修改 `req.system_prompt`**：
+        系统提示词是提示词缓存的前缀，往里追加内容会让整段前缀缓存失效，
+        每次带链接的请求都要重新计费、重新 prefill，属于审查明确禁止的做法。
+        附加内容标记为临时（mark_as_temp），不写进会话上下文。
+        """
         if not self.cfg.bool("inject_on_link", True):
+            return
+        if TextPart is None:
+            logger.info("[BiliBridge] 当前 AstrBot 没有 TextPart，跳过注入（仍可用 bilibili_read 工具）")
             return
         try:
             text = collect_message_text(event)
@@ -550,8 +565,26 @@ class BiliBridgePlugin(Star):
             material = await asyncio.wait_for(self.fetch_video(match.group(1)), timeout=timeout)
             if not material:
                 return
-            req.system_prompt = f"{req.system_prompt}\n\n{material}"
-            logger.info("[BiliBridge] 已注入 %s 的素材（%s 字）", match.group(1), len(material))
+
+            part = TextPart(text=material)
+            # 临时内容不落盘；方法名在版本间有过变动，两种都兼容
+            for attr in ("make_as_temp", "mark_as_temp"):
+                marker = getattr(part, attr, None)
+                if callable(marker):
+                    try:
+                        marked = marker()
+                        if marked is not None:
+                            part = marked
+                    except Exception:  # noqa: BLE001
+                        pass
+                    break
+
+            req.extra_user_content_parts.append(part)
+            logger.info(
+                "[BiliBridge] 已把 %s 的素材挂到本轮请求（%s 字，临时内容）",
+                match.group(1),
+                len(material),
+            )
         except asyncio.TimeoutError:
             logger.warning("[BiliBridge] 取素材超时，本轮不注入")
         except Exception:  # noqa: BLE001
