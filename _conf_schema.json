@@ -93,21 +93,21 @@
   "detail_hint": {
     "type": "string",
     "description": "写进核心记忆块的用法提示，告诉模型什么时候该调 bilibili_read、要不要讲长。",
-    "default": "（老大问起某条具体讲了什么、要看详细一点时，直接调 bilibili_read 工具，把那条的 BV 号传进去；拿到字幕要讲清楚：先一句主旨，再分 2~4 点讲关键内容，篇幅可以到两三百字，这时不必守着平时「短句」的习惯。别只报播放量，也别只甩一句情绪话。老大问「今天刷到什么」「最近看了什么」时，把上面列的每一条都逐个说出来（挑中的、跳过的都要报，一条一条报标题，别概括成「几条」），这是他要的清单。）"
+    "default": "（老大问起某条具体讲了什么时，用你自己的语气讲：两三句说完内容 + 你的判断，称呼照旧、可以有括号小动作；不要用「主旨：/关键三点：」这种提纲，也不要分点列表。他明确说「详细讲讲」时才展开到两三段，但仍然是说话的口吻。老大问「今天刷到什么」的时候，把上面列的每一条都逐个报标题，挑中的和跳过的都要报，别概括成「几条」。）"
   },
   "dm_forward_enabled": {
     "type": "bool",
-    "description": "是否把 B站 私信（比如刷视频插件给你的推荐）转发到 QQ。",
+    "description": "是否把 B站 私信转到 QQ。默认关闭——装完要你主动决定开不开；打开后还必须填 dm_owner_uid，否则不知道读哪个会话。",
     "default": false
   },
   "dm_owner_uid": {
     "type": "string",
-    "description": "监听哪个 B站 用户的私信会话（通常填你自己的 UID）。",
+    "description": "监听哪个 B站 用户的私信会话：填「跟你对话的那一方」的 UID，不是登录号自己。例：登录号是 1204686003（泡泡在加载），刷视频工具给主人 1252860980 发推荐，这里就填 1252860980。",
     "default": ""
   },
   "dm_target_session": {
     "type": "string",
-    "description": "转发到哪个 QQ 会话，形如 qq-main:FriendMessage:1792559819。",
+    "description": "转发到哪个 QQ 会话，形如 qq-main:FriendMessage:1792559819；留空会自动拼成「平台:好友消息:owner_uids 第一个」。",
     "default": ""
   },
   "dm_poll_interval": {
@@ -152,8 +152,8 @@
   },
   "dm_direction": {
     "type": "string",
-    "description": "转哪个方向的私信：them=对话对方的（默认；发信方若是另一个账号，例如用大号登录的刷视频插件，这里就是它）／me=本机登录账号自己发出的／any=都转。",
-    "default": "them"
+    "description": "转哪一边的私信。me=转「本机 bili-cli 登录的这个号」自己发出去的（刷视频工具给主人发推荐就是这种，默认）；them=转对端发来的（主人在 B站 回你、别人私信你）；any=都转。拿不准就跑 `bili dm read <uid> --limit 5` 看每条消息的 from 字段：跟你想要的那批一致就填那个。",
+    "default": "me"
   },
   "direct_reply_delay": {
     "type": "int",
@@ -169,5 +169,10 @@
     "type": "bool",
     "description": "老大分享视频过来时，顺手记一条长期记忆（按 BV 去重）。",
     "default": true
+  },
+  "ordinal_push_ttl_hours": {
+    "type": "int",
+    "description": "「第一个视频讲了什么」这类序号问题，认多久以内的推送顺序（小时）。刚推完的这批是这个时长内问「第几个」的依据；超过时间就按记忆清单解释。默认 12。",
+    "default": 12
   }
 }
