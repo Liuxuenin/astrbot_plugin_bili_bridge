@@ -1,0 +1,31 @@
+﻿name: astrbot_plugin_bili_bridge
+display_name: B站动态记忆桥
+short_desc: 把 B站 每日挑选写进 AI 记忆，被问细节时自动拉字幕讲解
+desc: >-
+  让 QQ 里的 AI 真正「看过」你 B站 账号今天刷了什么。
+
+  它做两件事：
+
+  1. **记忆同步**：定时读取 B站 侧的挑选结果（默认是刷视频类工具写出的
+  `digest/YYYY-MM.md`），压成一小段清单写进 MemoryCompanion 的核心记忆块，
+  每轮对话都会带上——于是你问「B站 今天看了什么」，它答得出来。
+
+  2. **按需解析**：注册 `bilibili_read` 工具。你追问某条视频讲了什么时，
+  它会调用本机 bili-cli 拉取字幕和元数据，**按原文讲解**，而不是照抄摘要。
+  没有字幕时退回 B站 官方 AI 总结。
+
+  另外它会处理 QQ 的「分享视频」卡片（JSON 消息没有文字，
+  链接藏在卡片里，`b23.tv` 短链会自动跟随解析），所以直接转发视频过来也能分析。
+
+  **全程本地**：所有请求都走本机 bili-cli，不经过任何第三方解析接口。
+version: 0.1.0
+author: paopao
+repo: https://github.com/Liuxuenin/astrbot_plugin_bili_bridge
+astrbot_version: ">=4.17.0"
+support_platforms:
+  - aiocqhttp
+tags:
+  - B站
+  - 记忆
+  - 视频
+  - 字幕

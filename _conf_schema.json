@@ -1,0 +1,98 @@
+{
+  "bili_executable": {
+    "type": "string",
+    "description": "bili-cli 的可执行文件。装在同名 Python 环境里时写 bili 即可，也可写完整路径。",
+    "default": "bili",
+    "hint": "Windows 上若 PATH 里没有，可填 C:\\path\\to\\Scripts\\bili.exe"
+  },
+  "digest_dir": {
+    "type": "string",
+    "description": "B站挑选结果所在目录。留空则用 ~/.dsh/bili-duty/digest。",
+    "default": ""
+  },
+  "skip_keyword": {
+    "type": "string",
+    "description": "挑选结果里带这个字样的行会被跳过（不进记忆）。",
+    "default": "跳过"
+  },
+  "owner_uids": {
+    "type": "string",
+    "description": "只有这些 QQ 号在私聊里能触发解析与注入，多个用英文逗号分隔。",
+    "default": ""
+  },
+  "memory_user_ids": {
+    "type": "string",
+    "description": "记忆写到哪些用户的记忆里（QQ 号，逗号分隔）。留空则沿用 owner_uids。",
+    "default": ""
+  },
+  "sync_enabled": {
+    "type": "bool",
+    "description": "是否定时把挑选结果同步进记忆。",
+    "default": true
+  },
+  "sync_interval": {
+    "type": "int",
+    "description": "同步间隔（秒）。",
+    "default": 600
+  },
+  "core_block_id": {
+    "type": "string",
+    "description": "核心记忆块的固定 id，每次覆盖更新同一个块。",
+    "default": "bili-digest-core"
+  },
+  "core_block_label": {
+    "type": "string",
+    "description": "核心记忆块的展示名。",
+    "default": "B站近况"
+  },
+  "core_max_chars": {
+    "type": "int",
+    "description": "核心块字数上限。MemoryCompanion 的全部核心块预算通常只有 800 字，别设太大。",
+    "default": 700
+  },
+  "core_max_items": {
+    "type": "int",
+    "description": "核心块最多列几条视频。",
+    "default": 8
+  },
+  "source_tag": {
+    "type": "string",
+    "description": "写入记忆时标记的来源名，方便在记忆库里筛选。",
+    "default": "bili-bridge"
+  },
+  "subtitle_max_chars": {
+    "type": "int",
+    "description": "喂给模型的字幕最多多少字，太长会吃掉上下文。",
+    "default": 6000
+  },
+  "desc_max_chars": {
+    "type": "int",
+    "description": "视频简介最多保留多少字。",
+    "default": 600
+  },
+  "cache_ttl": {
+    "type": "int",
+    "description": "同一个视频的解析结果缓存多久（秒），避免重复请求。",
+    "default": 3600
+  },
+  "command_timeout": {
+    "type": "int",
+    "description": "单条 bili 命令的超时（秒）。",
+    "default": 120
+  },
+  "inject_on_link": {
+    "type": "bool",
+    "description": "用户直接发来视频链接/卡片时，是否先把素材取好注入再回答。",
+    "default": true
+  },
+  "fallback_glob": {
+    "type": "string",
+    "description": "拿不到挑选结果时，退回读取的备份来源（支持通配符）。留空则不用。",
+    "default": ""
+  },
+  "detail_hint": {
+    "type": "string",
+    "description": "写进核心记忆块的用法提示，告诉模型什么时候该调 bilibili_read、要不要讲长。",
+    "default": "（老大问起某条具体讲了什么、要看详细一点时，直接调 bilibili_read 工具，把那条的 BV 号传进去；拿到字幕要讲清楚：先一句主旨，再分 2~4 点讲关键内容，篇幅可以到两三百字，这时不必守着平时「短句」的习惯。别只报播放量，也别只甩一句情绪话。）"
+  }
+}
