@@ -153,6 +153,37 @@ bili dm read <dm_owner_uid> --limit 5
 
 ---
 
+## 可选：语音转写（没有字幕时兜底）
+
+**默认不装、不开，配置时由你决定要不要。**
+
+它是干什么的：插件平时只读 B站 自己的字幕（CC 字幕 / AI 字幕）。这个可选功能是——
+**当那条视频没有 B站 AI 字幕时**，用本机的语音识别把视频里说的话转成文字，再交给模型去讲。
+不是识图 OCR，也不是云端服务，全在本机跑；有字幕的时候仍然优先用字幕（更准、更快）。
+
+代价：要在本机部署 **ffmpeg**（抽音频）和 **一个语音识别模型**（sherpa-onnx + 中文模型），合计几百 MB；
+第一次转写要十几秒到一两分钟（看时长），识别结果可能有错字、没有标点。
+
+```powershell
+# 装本机 ASR（有 4GB 以上 NVIDIA 显卡会自动用 GPU；国内建议带镜像参数）
+bili asr setup local --device auto --model qwen3-asr --github-proxy https://gh-proxy.com/ --hf-mirror
+bili asr status        # 看 ready 是不是 true
+
+# 装好之后，把插件的这个开关打开（默认是关的）
+#   transcribe_fallback: true
+```
+
+相关配置：`transcribe_fallback`（开关，默认关）、`transcribe_max_minutes`（只转前几分钟，默认 8）、
+`transcribe_timeout`（超时秒数，默认 180）。
+
+> **ffmpeg 没装怎么办**：`pip install imageio-ffmpeg`，再把它的 `ffmpeg.exe` 复制到 `bili.exe` 所在的
+> `Scripts` 目录就行。插件会把 `bili.exe` 的目录自动加进子进程 PATH，所以不用去改系统环境变量。
+> 实测：3 分钟的视频在 CPU 上转写约 8 秒（sensevoice 模型）。
+
+**没装就保持关着**——插件会退回 B站 官方 AI 总结，不会报错；装完再打开即可。
+
+---
+
 ## 「第一个视频讲了什么」按谁的顺序算？
 
 **按「最近一次推给你的那批」的顺序算**，不是按记忆里那份清单。

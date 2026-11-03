@@ -43,6 +43,55 @@ Get-ChildItem ~/.dsh/bili-duty/digest
 
 ---
 
+## 1.5 问用户：要不要装「语音转写」（可选，别自作主张装）
+
+这一步**必须先问一句**，而且要把「它到底是什么、为什么要装东西」说清楚。
+照下面这段问（可按语气改写，但要点不能少）：
+
+> 插件默认只读 B站 自己的字幕（CC 字幕 / AI 字幕）。
+> 额外还有一个**本地语音转文字**的兜底：**当这条视频没有 B站 AI 字幕时**，
+> 用你电脑上的语音识别把视频里说的话转成文字，再交给模型去讲。
+> 需要在本地部署 **ffmpeg + 一个语音识别模型**（几百 MB），第一次转写会慢十几秒。
+> 要装吗？
+
+要点复述一遍，问的时候别漏：
+
+- **触发条件**：只在「没有 B站 AI 字幕」时才用，有字幕仍然优先用字幕（更准、更快）
+- **它做什么**：本地语音转文字，把说的话转成文本，不是识图 OCR、也不是什么云端服务
+- **要装什么**：本机要部署 **ffmpeg**（抽音频）+ **ASR 模型**（sherpa-onnx + 中文模型）
+- **代价**：几百 MB 空间；第一次转写十几秒到一两分钟（按时长）；识别结果可能有错字
+
+**用户说不要**：跳过，保持 `transcribe_fallback: false`（默认就是关）。
+插件取不到字幕时会退回 B站 官方 AI 总结，不会报错。
+
+**用户说要**：
+
+```powershell
+bili asr setup local --device auto --model qwen3-asr --github-proxy https://gh-proxy.com/ --hf-mirror
+bili asr status        # ready 必须为 true，ffmpeg / sherpa_onnx / vad_model 三项都为 true
+```
+
+> 显卡小（<4GB）或想省事：把 `qwen3-asr` 换成 `sensevoice --device cpu`——体积小、CPU 就能跑、
+> 中文够用，代价是没标点、准确率略低。qwen3-asr 要装 torch（2GB+），国内网络容易失败。
+
+装完把配置里的开关打开（并在 README 里说明这是可选依赖）：
+
+```json
+{
+  "transcribe_fallback": true,
+  "transcribe_max_minutes": 8,
+  "transcribe_timeout": 180
+}
+```
+
+验证：随便挑一条**没有字幕**的视频（先用 `bili video subtitle <BV>` 确认返回 `没有可用字幕`），
+发到 QQ 里问「这条讲了什么」，日志应出现转写，回答里会写「这条没有 CC 字幕，以下是本机语音转写的前 N 分钟」。
+
+> 装之前先确认 `bili asr status` 的 `ready`；没就绪时插件只会打一行日志然后退回官方总结，
+> 不会报错，但也不会给你转写——所以别把「装了」当成「好了」，要看日志。
+
+---
+
 ## 2. 改配置（下面这些键，一项都别漏）
 
 先备份，再改（`utf-8-sig` 读写，别把中文写坏）：

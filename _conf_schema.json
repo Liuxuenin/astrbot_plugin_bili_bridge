@@ -174,5 +174,20 @@
     "type": "int",
     "description": "「第一个视频讲了什么」这类序号问题，认多久以内的推送顺序（小时）。刚推完的这批是这个时长内问「第几个」的依据；超过时间就按记忆清单解释。默认 12。",
     "default": 12
+  },
+  "transcribe_fallback": {
+    "type": "bool",
+    "description": "【可选】没有 CC / AI 字幕时，是否用本机语音转写兜底。需要先运行 `bili asr setup local` 装好 ASR（ffmpeg + sherpa-onnx + 模型，几百 MB）。没装就别开，开了也只是回退到官方 AI 总结。默认关，装完再打开。",
+    "default": false
+  },
+  "transcribe_max_minutes": {
+    "type": "int",
+    "description": "语音转写最多转前几分钟（控制耗时和 Token）。默认 8。",
+    "default": 8
+  },
+  "transcribe_timeout": {
+    "type": "int",
+    "description": "单次语音转写的超时秒数。默认 180。",
+    "default": 180
   }
 }
