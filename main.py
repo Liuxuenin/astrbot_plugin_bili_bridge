@@ -3,13 +3,15 @@
 把「B站 那一侧每天挑了什么」变成 QQ 里这个 AI 的真实记忆，并且在她被追问细节时
 去拉字幕讲解，而不是照抄摘要。
 
-做三件事：
+做四件事：
   1. 定时读挑选结果（digest/YYYY-MM.md），压成一小段写进 MemoryCompanion 的核心记忆块；
      核心块每轮对话都会注入，所以「B站 今天看了什么」这类问题答得出来。
   2. 注册 LLM 工具 bilibili_read(bvid)：调本机 bili-cli 取元数据 + 字幕，
      无字幕退回 B站 官方 AI 总结，结果按 TTL 缓存。
   3. 处理 QQ「分享视频」的 JSON 卡片：消息没有文字时补一段可读文字（否则管线判定消息无效、
      模型不会被叫起来），并在请求前把素材注入。
+  4. 「刷视频」口令：QQ 上说一句「刷视频 / 刷B站 / 看视频」，就去让 DSH 那边的刷B站
+     真跑一轮（走它自己的 /api/bili-duty/run，不复制任何业务逻辑），跑完把挑到的发回来。
 
 设计约束：
   - 全程本地，只调本机 bili-cli，不经过任何第三方解析接口。
@@ -20,12 +22,17 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import hashlib
+import hmac
 import json
 import os
 import random
 import re
+import subprocess
 import time
+import urllib.error
+import urllib.request
 from collections import OrderedDict
 from datetime import datetime
 from pathlib import Path
@@ -43,7 +50,7 @@ except Exception:  # noqa: BLE001
     TextPart = None  # type: ignore[assignment]
 
 PLUGIN_NAME = "astrbot_plugin_bili_bridge"
-PLUGIN_VERSION = "0.4.2"
+PLUGIN_VERSION = "0.5.2"
 
 MEMORY_PLUGIN_NAME = "astrbot_plugin_memory_companion"
 
@@ -566,6 +573,292 @@ def scan_digest_dir(digest_dir: str) -> dict[str, Any]:
     return info
 
 
+# ── 「说一句就刷一轮」：把话递给 DSH 那边的刷B站 ─────────────────────────────
+#
+# 为什么不在这边自己「跑一轮」（2026-11-05 实测过一遍才定的方案）：
+#   · 一轮 = 一个 headless DSH 会话，提示词里内联着整份值班章程（26KB 的 duty.md）。
+#     那一轮的 profile 关掉了文件系统（这是它的安全设计），所以它**读不了**章程，
+#     只能由宿主把章程拼进命令行一起递过去。
+#   · 想在这边照抄那条命令，就得在 Python 里重建宿主那 300 行提示词拼装逻辑；
+#     而且拼出来约 31K 字符，Windows 命令行上限 32767 —— 贴着上限跑，随时会炸。
+#   · 但那个插件自己开着 HTTP 口（给它设置页用的）：`POST /api/bili-duty/run`
+#     就是面板上那个「立刻跑一轮」按钮，冷却、跨宿主运行锁、额度记账它都算好了。
+#   ⇒ 这边只发一个请求，让它自己去跑。业务逻辑一行都不复制。
+#
+# 认证怎么过的：DSH 给浏览器发的是「签名 cookie」，签名密钥就躺在
+# ~/.dsh/.credentials.yaml 的 client-connection/browser-session 里。本机进程读得到，
+# 就按它的格式自己签一张（名 = dsh-auth-<sha256(host:port)>，值 = v1.<payload>.<hmac>）。
+# 端口每次启动是随机的回环端口，所以要现找 —— 见 find_dsh_gateway()。
+DSH_HOME = Path(os.path.expanduser("~/.dsh"))
+DSH_CREDENTIALS = DSH_HOME / ".credentials.yaml"
+DSH_PROCESS_NAMES = ("deepseek harness",)
+DSH_COOKIE_PREFIX = "dsh-auth-"
+DSH_COOKIE_DAYS = 30.0
+
+DEFAULT_SCROLL_ACK = "行，去看看。刷完告诉你。"
+
+# 口令的形状：先去掉空白和标点，再看是不是「(快/去/帮我…) + 刷/看/翻 + …视频/B站…」。
+# 特意留了 `SCROLL_BLOCKERS`：带「什么/哪/讲/评论」的是在**问内容**，不是叫它去刷，
+# 那种交给模型、别抢。
+SCROLL_LEAD_RE = re.compile(r"^(?:请|你|快|去|帮我|给我|帮|现在|赶紧|再|陪|一起|立刻|马上|就|麻烦)+")
+SCROLL_VERB_RE = re.compile(r"^(?:刷|看|翻|逛)")
+SCROLL_HINTS = ("视频", "b站", "哔哩", "bilibili", "刷一轮", "刷新", "去刷")
+SCROLL_BLOCKERS = (
+    "什么", "啥", "哪些", "哪", "吗", "多少", "讲", "弹幕", "评论", "字幕",
+    "内容", "为什么", "怎么", "如何", "介绍",
+    "不想", "不用", "别刷", "别去", "没空", "算了",
+)
+
+
+class DshBridgeError(RuntimeError):
+    """连不上 DSH 网关 / 认证失败 / 返回看不懂。"""
+
+
+def _b64u(raw: bytes) -> str:
+    return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
+
+
+def _b64u_decode(text: str) -> bytes:
+    pad = "=" * (-len(text) % 4)
+    return base64.urlsafe_b64decode((text + pad).encode("ascii"))
+
+
+def read_dsh_browser_secret(path: Path | None = None) -> str:
+    """从 DSH 的凭证文件里取出「浏览器会话」的签名密钥（base64url 字符串）。"""
+
+    target = path or DSH_CREDENTIALS
+    try:
+        text = target.read_text(encoding="utf-8", errors="replace")
+    except OSError as exc:
+        raise DshBridgeError(f"读不到 DSH 凭证文件 {target}（{exc}）") from exc
+    match = re.search(
+        r"client-connection/browser-session:(.*?)(?=\ndeepseek-|\Z)", text, re.S
+    )
+    chunk = match.group(1) if match else text
+    secret = re.search(r"secret:\s*([A-Za-z0-9_\-+/=]{20,})", chunk)
+    if not secret:
+        raise DshBridgeError(
+            "DSH 凭证文件里没有 browser-session 的 secret —— 版本可能变了，"
+            "这条触发路要重新对着 dsh 的客户端认证实现改一遍"
+        )
+    return secret.group(1).strip()
+
+
+def mint_dsh_cookie(
+    authority: str, secret_b64: str, *, days: float = DSH_COOKIE_DAYS
+) -> tuple[str, str]:
+    """签一张 DSH 认的浏览器 cookie。返回 (cookie 名, cookie 值)。"""
+
+    secret = _b64u_decode(secret_b64)
+    now = int(time.time() * 1000)
+    payload = {
+        "version": 1,
+        "authority": authority,
+        "issuedAt": now,
+        "expiresAt": now + int(days * 86400_000) - 60_000,
+    }
+    body = _b64u(
+        json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    )
+    sign = hmac.new(secret, body.encode("ascii"), hashlib.sha256).digest()
+    name = DSH_COOKIE_PREFIX + _b64u(hashlib.sha256(authority.encode("utf-8")).digest())
+    return name, f"v1.{body}.{_b64u(sign)}"
+
+
+def _run_quiet(args: list[str]) -> str:
+    """跑一条只看输出的系统命令（不出窗口、失败当空）。"""
+
+    try:
+        proc = subprocess.run(  # noqa: S603 - 参数是写死的，没有用户输入
+            args,
+            capture_output=True,
+            timeout=20,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+        return (proc.stdout or b"").decode("utf-8", "replace")
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def _loopback_listeners() -> dict[int, int]:
+    """{端口: PID}：本机回环上正在 LISTEN 的 TCP 端口（只用系统自带的 netstat）。"""
+
+    found: dict[int, int] = {}
+    for line in _run_quiet(["netstat", "-ano", "-p", "TCP"]).splitlines():
+        parts = line.split()
+        if len(parts) < 5 or parts[3].upper() != "LISTENING":
+            continue
+        local, pid = parts[1], parts[4]
+        host, _, port = local.rpartition(":")
+        if host not in ("127.0.0.1", "[::1]", "0.0.0.0", "[::]"):
+            continue
+        try:
+            found[int(port)] = int(pid)
+        except ValueError:
+            continue
+    return found
+
+
+def _process_names(pids: set[int]) -> dict[int, str]:
+    """{PID: 进程名}：一次 tasklist 全取，别一个 PID 一次。"""
+
+    names: dict[int, str] = {}
+    for line in _run_quiet(["tasklist", "/FO", "CSV", "/NH"]).splitlines():
+        cells = [cell.strip().strip('"') for cell in line.split('","')]
+        if len(cells) < 2:
+            continue
+        try:
+            pid = int(cells[1].strip('"'))
+        except ValueError:
+            continue
+        if pid in pids:
+            names[pid] = cells[0].strip('"').lower()
+    return names
+
+
+def find_dsh_gateway(preferred: str = "") -> list[str]:
+    """列出可能的 DSH 网关地址（形如 127.0.0.1:63825），优先用配置里手填的。
+
+    端口每次启动都可能变（本机随机回环口），所以不能写死。
+    ⚠️ 不依赖 psutil：AstrBot 实际跑的那个 Python 里常常没有它（本机 2026-11-05 实测就没有），
+    所以主路是系统自带的 netstat + tasklist；认不出来就把回环上的候选都交出去，
+    由调用方拿签名 cookie 一个个问 —— 问得到 /api/bili-duty/status 的那个才是 DSH。
+    """
+
+    hint = str(preferred or "").strip()
+    if hint:
+        hint = hint.replace("http://", "").replace("https://", "").strip("/")
+        return [hint if ":" in hint else f"127.0.0.1:{hint}"]
+
+    listeners = _loopback_listeners()
+    if not listeners:
+        raise DshBridgeError("本机回环上一个监听端口都没看到（netstat 没输出？）")
+
+    names = _process_names(set(listeners.values()))
+    ours = [
+        port
+        for port, pid in listeners.items()
+        if any(mark in names.get(pid, "") for mark in DSH_PROCESS_NAMES)
+    ]
+    if not ours:
+        # 认不出进程名（tasklist 被策略挡了 / 名字改了）⇒ 全部候选交给调用方去问
+        ours = sorted(listeners, reverse=True)[:40]
+    return [f"127.0.0.1:{port}" for port in sorted(set(ours))]
+
+
+# 日报里每个 `### BV…` 一段。提取「挑到哪几条」就靠它 —— 和宿主数条数用的是同一个锚点。
+REPORT_BLOCK_RE = re.compile(r"^###[ \t]*(BV[0-9A-Za-z]{10})[ \t]*$", re.M)
+
+
+def parse_report_items(text: str) -> list[dict[str, str]]:
+    """把日报拆成一条条：{bv, title, up, link, tier, why, line}。
+
+    日报是模型写的，字段顺序稳定但偶尔缺项，所以每一项都容错：
+    找不到就留空，绝不因为少一行就整条丢掉（那是它辛苦刷出来的东西）。
+    """
+
+    items: list[dict[str, str]] = []
+    matches = list(REPORT_BLOCK_RE.finditer(text or ""))
+    for index, match in enumerate(matches):
+        start = match.end()
+        end = matches[index + 1].start() if index + 1 < len(matches) else len(text)
+        block = text[start:end]
+
+        def field(name: str) -> str:
+            found = re.search(
+                rf"^[-*]?\s*\*{{0,2}}{name}\*{{0,2}}\s*[：:]\s*(.+)$", block, re.M
+            )
+            return found.group(1).strip() if found else ""
+
+        link = re.search(r"https?://\S*?(BV[0-9A-Za-z]{10})\S*", block)
+        items.append(
+            {
+                "bv": match.group(1),
+                "title": field("标题"),
+                "up": field("UP"),
+                "link": link.group(0) if link else f"https://www.bilibili.com/video/{match.group(1)}",
+                "tier": field("档位"),
+                "why": field("为什么值得"),
+                "line": field("一句话"),
+            }
+        )
+    return items
+
+
+DIGEST_TIER_WORDS = ("值得看", "可以看", "值得一看", "不用看", "不值得", "一般", "跳过")
+
+
+def parse_digest_items(text: str) -> list[dict[str, str]]:
+    """把 digest 归档（`日期 · BV · 标题 · UP · 结论 · 档位 · 链接`）拆成一条条。
+
+    为什么要走这一份：日报是模型自己用 duty_report_append 写的，偶尔会漏写（2026-11-05
+    实测就有一轮：判重表和归档都落了，日报没落）。归档是同一轮必写的，而且一行一条、
+    格式固定 —— 拿它当「这一轮挑到哪几条」的兜底，比只认日报稳。
+    """
+
+    items: list[dict[str, str]] = []
+    for line in str(text or "").splitlines():
+        row = normalize_row(line)
+        if not DIGEST_LINE_RE.match(row):
+            continue
+        parts = [part.strip() for part in row.split(" · ")]
+        if len(parts) < 3:
+            continue
+        bv_match = BV_RE.search(parts[1])
+        if not bv_match:
+            continue
+        note = ""
+        tier = ""
+        for part in parts[4:]:
+            if part.startswith("http"):
+                continue
+            if part in DIGEST_TIER_WORDS:
+                tier = part
+            elif not note:
+                note = part
+        link = re.search(r"https?://\S+", row)
+        items.append(
+            {
+                "bv": bv_match.group(1),
+                "title": parts[2],
+                "up": parts[3] if len(parts) > 3 else "",
+                "note": note,
+                "tier": tier,
+                "link": link.group(0)
+                if link
+                else f"https://www.bilibili.com/video/{bv_match.group(1)}",
+            }
+        )
+    return items
+
+
+def is_scroll_request(text: str, extra: tuple[str, ...] | list[str] = ()) -> bool:
+    """这句话是不是在叫它「去刷一轮」。"""
+
+    raw = re.sub(r"[\s，,。.!！~～?？、…]+", "", str(text or ""))
+    raw = re.sub(r"^@\S{1,20}", "", raw).strip()
+    if not raw or len(raw) > 14:
+        return False
+    words = [w.strip() for w in extra if w and str(w).strip()]
+    if any(word in raw for word in words):
+        return True
+    low = raw.lower()
+    if not any(hint in low for hint in SCROLL_HINTS):
+        return False
+    if any(blocker in raw for blocker in SCROLL_BLOCKERS):
+        return False
+    body = SCROLL_LEAD_RE.sub("", raw)
+    if SCROLL_VERB_RE.match(body):
+        return True
+    # 「请去刷一轮视频」这种前面还挂着个把字的：动词落在前 3 个字里也算。
+    # （2026-11-05 真机踩过：漏了「请」，口令没接住，最后是模型自己去调工具补的——
+    #   能用，但那条路绕过了口令，说话和做事就不同步了。）
+    for index in range(1, min(4, len(body))):
+        if SCROLL_VERB_RE.match(body[index:]):
+            return True
+    return False
+
+
 # ── 插件本体 ────────────────────────────────────────────────────────────────
 
 
@@ -593,6 +886,14 @@ class BiliBridgePlugin(Star):
         self._stopping = False
         # 上一次同步的结果（成功/跳过 + 原因），给 /bili_doctor 看，不落盘
         self._last_sync: dict[str, Any] = {}
+        # 「刷一轮」那条路：DSH 网关地址缓存（端口每次启动都会变，探到一次用一阵子）
+        self._gw_cache: tuple[float, str] = (0.0, "")
+        self._gw_status: dict[str, Any] = {}
+        self._scroll_tasks: set[asyncio.Task] = set()
+        # 上一次真开跑的时间（我们自己那道防连点的闸）
+        self._last_scroll_at: float = 0.0
+        # 刚回报过的那批 BV + 时间：B站 那边同一轮的私信会晚几十秒才到，别重复推一遍
+        self._reported_bvs: tuple[float, set[str]] = (0.0, set())
 
     # ── 生命周期 ────────────────────────────────────────────────────────────
     async def initialize(self) -> None:
@@ -614,6 +915,16 @@ class BiliBridgePlugin(Star):
                 "[BiliBridge] 私信转发默认关闭：B站 发来的私信不会推到 QQ。"
                 "想开就打开 dm_forward_enabled，并填 dm_owner_uid（对端 UID）"
                 "与 dm_target_session（留空会自动拼）"
+            )
+        if (
+            self.cfg.bool("scroll_enabled", True)
+            and not self.cfg.bool("scroll_report", False)
+            and not self.cfg.bool("dm_forward_enabled", False)
+        ):
+            # 现在「刷完发什么」只靠 B站 那条私信的转发。这个组合下就一条都不会有。
+            logger.warning(
+                "[BiliBridge] 注意：scroll_report 与 dm_forward_enabled 都关着 ⇒ "
+                "刷完这一轮的结果**谁都不会报**（想收就开其中一个）"
             )
         logger.info(
             "[BiliBridge] 已启动（同步=%s，间隔=%ss，白名单=%s）",
@@ -1161,6 +1472,14 @@ class BiliBridgePlugin(Star):
                     "[BiliBridge] 私信不含视频链接，跳过不转（%s 字）", len(body)
                 )
                 continue
+            if self._already_reported(body):
+                # 这一批刚在「刷完了」那条里报过 ⇒ 别再推一遍（同一条私信晚到几十秒而已）
+                advanced_to = int(msg.get("seqno") or 0)
+                logger.info(
+                    "[BiliBridge] 这批刚报过报告了，私信不再重复推（%s）",
+                    "、".join(bvs_in_order(body)) or "?",
+                )
+                continue
             ok_all = True
             for chunk in self._chunk_text(f"📬 B站 私信\n{body}"):
                 try:
@@ -1702,6 +2021,589 @@ class BiliBridgePlugin(Star):
         except Exception:  # noqa: BLE001
             logger.exception("[BiliBridge] 直接回清单失败，交回模型")
 
+    # ── 处理器 3.6：说一句「刷视频」就真去刷一轮 ────────────────────────────
+    def _scroll_extra_words(self) -> list[str]:
+        raw = self.cfg.str("scroll_extra_words", "")
+        return [w.strip() for w in re.split(r"[,，\s]+", raw) if w.strip()]
+
+    def _dsh_gateway(self) -> str:
+        """拿到一个「确认能用」的 DSH 网关地址（带缓存）。
+
+        探测本身就是最好的校验：签一张 cookie 去问 /api/bili-duty/status，
+        回 ok 才算数。所以这里不只看端口开着——端口开着但认证不过、或者那根本
+        不是 DSH，都会在这里被排掉。
+        """
+
+        now = time.monotonic()
+        cached_at, cached = self._gw_cache
+        if cached and now - cached_at < 300:
+            return cached
+
+        secret = read_dsh_browser_secret()
+        problems: list[str] = []
+        for address in find_dsh_gateway(self.cfg.str("dsh_gateway", "")):
+            name, value = mint_dsh_cookie(address, secret)
+            request = urllib.request.Request(
+                f"http://{address}/api/bili-duty/status",
+                headers={"Cookie": f"{name}={value}"},
+            )
+            try:
+                with urllib.request.urlopen(request, timeout=3) as resp:
+                    payload = json.loads(resp.read().decode("utf-8", "replace"))
+            except urllib.error.HTTPError as exc:
+                problems.append(f"{address} → HTTP {exc.code}")
+                continue
+            except Exception as exc:  # noqa: BLE001
+                problems.append(f"{address} → {exc}")
+                continue
+            if isinstance(payload, dict) and payload.get("ok"):
+                self._gw_status = payload
+                self._gw_cache = (now, address)
+                return address
+            problems.append(f"{address} → 回的不是状态")
+        raise DshBridgeError(
+            "连不上 DSH 的刷B站接口（"
+            + "；".join(problems or ["没找到可用的端口"])
+            + "）。DSH 是不是没开？"
+        )
+
+    def _dsh_request(
+        self,
+        path: str,
+        method: str = "GET",
+        payload: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """往 DSH 网关发一个请求，返回 JSON（同步函数，调用方丢线程池里跑）。"""
+
+        address = self._dsh_gateway()
+        secret = read_dsh_browser_secret()
+        name, value = mint_dsh_cookie(address, secret)
+        headers = {"Cookie": f"{name}={value}"}
+        body: bytes | None = None
+        if payload is not None:
+            body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+            headers["Content-Type"] = "application/json"
+        elif method.upper() == "POST":
+            body = b""
+        request = urllib.request.Request(
+            f"http://{address}{path}",
+            method=method,
+            headers=headers,
+            data=body,
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=30) as resp:
+                return json.loads(resp.read().decode("utf-8", "replace"))
+        except urllib.error.HTTPError as exc:
+            body = exc.read().decode("utf-8", "replace")[:200]
+            # 认证过期/密钥变了 ⇒ 下次重新探一遍，别一直拿着一张坏 cookie 撞
+            self._gw_cache = (0.0, "")
+            raise DshBridgeError(f"DSH 返回 HTTP {exc.code}：{body}") from exc
+        except Exception as exc:  # noqa: BLE001
+            self._gw_cache = (0.0, "")
+            raise DshBridgeError(f"跟 DSH 说话失败：{exc}") from exc
+
+    def _duty_home(self) -> Path:
+        home = str(self._gw_status.get("home") or "")
+        return Path(home) if home else DSH_HOME / "bili-duty"
+
+    def _report_path(self) -> Path:
+        saved = str(self._gw_status.get("report") or "")
+        if saved:
+            return Path(saved)
+        return self._duty_home() / "out" / f"{datetime.now():%Y-%m-%d}.md"
+
+    def _digest_path(self) -> Path:
+        return self._duty_home() / "digest" / f"{datetime.now():%Y-%m}.md"
+
+    def _read_digest_text(self) -> str:
+        try:
+            return self._digest_path().read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            return ""
+
+    def _known_bvs(self) -> set[str]:
+        """触发前记一份「已经出现过的 BV」：日报 + 归档两边都算。
+
+        跑完拿它做差，新出现的才是这一轮挑到的。只看日报会在它漏写时误报，
+        只看归档又会把「跳过」的也算成挑到的 —— 所以两边都要。
+        """
+
+        return {
+            item["bv"] for item in parse_report_items(self._read_report_text())
+        } | {item["bv"] for item in parse_digest_items(self._read_digest_text())}
+
+    def _duty_log_mark(self) -> tuple[Path, int]:
+        log = self._duty_home() / "duty.log"
+        try:
+            return log, log.stat().st_size
+        except OSError:
+            return log, 0
+
+    @staticmethod
+    def _duty_log_since(mark: tuple[Path, int]) -> str:
+        path, size = mark
+        try:
+            with path.open("rb") as handle:
+                handle.seek(size)
+                return handle.read().decode("utf-8", "replace")
+        except OSError:
+            return ""
+
+    # ── 冷却这件事（只在「我们这边」解决，不去动 DSH 的代码）──────────────
+    #
+    # 刷B站挡住了手动轮，会回一句「手动轮刚跑过，再等 9 分钟（防手滑狂点）」
+    # （`manualCooldownMin`，默认 10 分钟）。那句话是它算出来的，我们改不了它——
+    # 但它的**配置接口**是公开的：`POST /api/bili-duty/config`。
+    # 所以两条路：
+    #   ① 绕过：临时把 `manualCooldownMin` 改成 0 ⇒ 立刻开跑 ⇒ **马上改回原值**。
+    #      只用它的公开接口，不碰它的内部状态文件；读不到原值就不绕（宁可不跑，别把人的设置搞丢）。
+    #   ② 排队：从那句「再等 N 分钟」里抠出分钟数，定个闹钟到点自己开。
+    # 另外两种「不是冷却、但也没开跑」的情况（上一轮还没结束 / 另一个宿主占着锁）绕不过去，
+    # 只能排队——每 30 秒探一次。
+    COOLDOWN_RE = re.compile(r"再等|刚跑过|冷却|cooldown", re.I)
+    BUSY_WORDS = ("还没结束", "还没跑完", "正在跑", "另一个宿主", "busy", "上一条")
+
+    @staticmethod
+    def _payload_error(payload: dict[str, Any]) -> str:
+        return str(payload.get("error") or payload.get("reason") or "")
+
+    @classmethod
+    def _cooldown_minutes(cls, error: str) -> int:
+        """从「再等 9 分钟」里抠出分钟数；抠不到返回 0。"""
+
+        found = re.search(r"再等\s*(\d+)\s*分钟", error or "")
+        return int(found.group(1)) if found else 0
+
+    async def _post_run(self) -> dict[str, Any]:
+        """POST /api/bili-duty/run；连不上也返回一个 started=False 的包，调用方只需看字段。"""
+
+        try:
+            return await asyncio.to_thread(
+                self._dsh_request, "/api/bili-duty/run", "POST"
+            )
+        except DshBridgeError as exc:
+            logger.warning("[BiliBridge] 刷一轮触发失败：%s", exc)
+            return {"ok": False, "started": False, "error": f"连不上 DSH（{exc}）"}
+
+    async def _duty_config(self) -> dict[str, Any]:
+        try:
+            payload = await asyncio.to_thread(self._dsh_request, "/api/bili-duty/config")
+        except DshBridgeError as exc:
+            logger.warning("[BiliBridge] 读刷B站配置失败：%s", exc)
+            return {}
+        config = payload.get("config")
+        return config if isinstance(config, dict) else {}
+
+    async def _set_manual_cooldown(self, minutes: int) -> bool:
+        """改刷B站的手动轮冷却（分钟）。走它的配置接口，成功与否都返回布尔。"""
+
+        try:
+            payload = await asyncio.to_thread(
+                self._dsh_request,
+                "/api/bili-duty/config",
+                "POST",
+                {"manualCooldownMin": max(0, int(minutes))},
+            )
+        except DshBridgeError as exc:
+            logger.warning("[BiliBridge] 改刷B站冷却失败：%s", exc)
+            return False
+        return bool(payload.get("ok", True))
+
+    async def _round_started(
+        self,
+        umo: str,
+        before: set[str],
+        mark: tuple[Path, int],
+        payload: dict[str, Any],
+    ) -> dict[str, Any]:
+        """这一轮已经开跑了：记账 + 挂个后台任务盯着它结束。
+
+        ⚠️ 盯梢**永远挂**（哪怕不回报）：一是要知道「这一轮还在跑」，
+        二是跑完要把 `_scroll_tasks` 清掉 —— 不然间隔闸的话就说不准了。
+        """
+
+        self._last_scroll_at = time.time()
+        logger.info(
+            "[BiliBridge] 刷一轮已开跑（%s，目录 %s）",
+            payload.get("why", "manual"),
+            payload.get("cwd", "?"),
+        )
+        if umo:
+            task = asyncio.create_task(self._report_scroll_round(umo, before, mark))
+            self._scroll_tasks.add(task)
+            task.add_done_callback(self._scroll_tasks.discard)
+        return {
+            "started": True,
+            "status": "started",
+            "say": self.cfg.str("scroll_ack", "") or DEFAULT_SCROLL_ACK,
+        }
+
+    async def _launch_scroll(self, umo: str) -> dict[str, Any]:
+        """真去开一轮。返回 {"started", "status", "say", ...}。
+
+        ⚠️ 间隔闸放在这里、而不是只放在口令入口：不管从哪条路进来（口令、模型自己调工具、
+        之前排着的那次），**都得过这一关**。老大定的规矩是——拒绝了就是拒绝了，
+        绝不能过一会儿自己找补；只有他再喊一次，才会真的跑。
+        """
+
+        gap = max(0, self.cfg.int("scroll_min_gap", 180))
+        if self._last_scroll_at and gap:
+            elapsed = time.time() - self._last_scroll_at
+            if elapsed < gap:
+                wait = max(1, int(gap - elapsed))
+                running = any(not task.done() for task in self._scroll_tasks)
+                return {
+                    "started": False,
+                    "status": "gap",
+                    "wait": wait,
+                    "running": running,
+                    "say": f"刚刷过，再等 {wait} 秒吧——一轮要跑一两分钟。",
+                }
+
+        before = self._known_bvs()
+        mark = self._duty_log_mark()
+        payload = await self._post_run()
+        if payload.get("started"):
+            return await self._round_started(umo, before, mark, payload)
+
+        error = self._payload_error(payload)
+        if self.COOLDOWN_RE.search(error):
+            minutes = self._cooldown_minutes(error)
+            if self.cfg.bool("scroll_ignore_cooldown", True):
+                config = await self._duty_config()
+                original = config.get("manualCooldownMin")
+                if isinstance(original, (int, float)):
+                    logger.info(
+                        "[BiliBridge] 手动轮在冷却（还有 %s 分钟）⇒ 临时把冷却设成 0，跑完再改回 %s",
+                        minutes or "?",
+                        int(original),
+                    )
+                    if await self._set_manual_cooldown(0):
+                        try:
+                            payload = await self._post_run()
+                            if payload.get("started"):
+                                return await self._round_started(
+                                    umo, before, mark, payload
+                                )
+                            error = self._payload_error(payload)
+                        finally:
+                            # 这一句必须无条件执行：宁可这一轮没开成，也不能把人的冷却设置留在 0
+                            if not await self._set_manual_cooldown(int(original)):
+                                logger.warning(
+                                    "[BiliBridge] ⚠️ 冷却没改回去（现在还是 0）——"
+                                    "请在 DSH 的刷B站设置里把「手动轮冷却」调回 %s 分钟",
+                                    int(original),
+                                )
+                else:
+                    logger.warning(
+                        "[BiliBridge] 读不到原冷却值 ⇒ 这回不绕过（不能瞎改人的设置）"
+                    )
+            # 绕不过去 / 本来就不想绕 ⇒ 这一轮不跑，等他过几分钟再喊（不自己排着）
+            return {
+                "started": False,
+                "status": "queued",
+                "minutes": minutes or 0,
+                "say": (
+                    f"这会儿在冷却，还得 {minutes or '几'} 分钟。"
+                    f"回头再喊我一声就行。"
+                ),
+            }
+
+        if any(word.lower() in error.lower() for word in self.BUSY_WORDS):
+            return {
+                "started": False,
+                "status": "busy",
+                "say": "上一轮还在跑，这轮没开。等它收尾你再喊我。",
+            }
+
+        logger.info("[BiliBridge] 刷一轮没跑起来：%s", error)
+        return {
+            "started": False,
+            "status": "failed",
+            "reason": error or "那边没开始跑",
+            "say": f"这回没跑成：{error or '那边没开始跑'}",
+        }
+
+    async def _start_scroll(self, event: AstrMessageEvent) -> dict[str, Any]:
+        """让 DSH 那边的刷B站开跑一轮（口令与 LLM 工具共用这一个入口）。
+
+        返回 {"started": 有没有跑, "status": started/gap/queued/busy/failed, ...}。
+        ⚠️ 这里的 `say` 只是兜底文案；实际说话的是模型（见 scroll_on_phrase / inject_scroll_note）。
+        ⚠️ **拒绝就是拒绝**：gap / queued / busy 都不会留任何「过会儿自己跑」的东西。
+        """
+
+        umo = str(getattr(event, "unified_msg_origin", "") or "")
+        try:
+            await asyncio.to_thread(self._dsh_gateway)
+        except DshBridgeError as exc:
+            logger.warning("[BiliBridge] 刷一轮触发失败：%s", exc)
+            return {
+                "started": False,
+                "status": "failed",
+                "reason": str(exc),
+                "say": f"刷不了：{exc}",
+            }
+
+        result = await self._launch_scroll(umo)
+        result.setdefault("status", "started" if result.get("started") else "failed")
+        return result
+
+    # ── 把「发生了什么」交给模型，让她自己开口（别再让插件说人机话）─────
+    def _scroll_note_text(self, result: dict[str, Any]) -> str:
+        """给模型的一段后台说明（临时注入，不落盘）。"""
+
+        status = str(result.get("status") or "")
+        if status == "started":
+            body = (
+                "老大让你去刷B站，这件事已经提交出去了，正在后台刷；"
+                "跑完 B站 那边会把挑到的推送过来（不是你现在要说的事）。"
+                "现在回一句你自己的话就行——别报结果、别编标题、别说「稍等我去看看」这种客服话，"
+                "也别承诺具体几条。"
+            )
+        elif status == "gap":
+            where = "这一轮还在跑" if result.get("running") else "才刚刷过一轮"
+            body = (
+                f"老大又让你去刷，但{where}，这一轮**没有**开刷，也没给他排着。"
+                "回一句你自己的话就行——嫌他急、说懒得刷、让他等会儿都可以。"
+                "**千万别报具体多少秒 / 多少分钟**（那是机器话，人不会这么说），"
+                "也别装作已经开刷、别报任何视频。"
+            )
+        elif status == "queued":
+            body = (
+                "老大让你去刷，但刷B站那边正在冷却，这一轮**没有**开刷，也没排着。"
+                "回一句你自己的话就行（「等会儿」「别急」「懒得刷」这类都行），"
+                "**别报具体多少分钟**，也别说「冷却」这种词。"
+            )
+        elif status == "busy":
+            body = (
+                "老大让你去刷，但上一轮还在跑，这一轮**没有**开刷，也没排着。"
+                "回一句你自己的话，让他等下再喊就行，**别报具体时间**。"
+            )
+        else:
+            body = (
+                f"老大让你去刷，但没开成：{result.get('reason') or '那边没给说法'}。"
+                "回一句你自己的话，如实说没开成，别编结果。"
+            )
+        return f"（后台：{body}）"
+
+    def _scroll_status_text(self, result: dict[str, Any]) -> str:
+        """给 LLM 工具用的状态回执：只讲事实，措辞由模型决定。"""
+
+        status = str(result.get("status") or "")
+        if status == "started":
+            return (
+                "已开刷：后台跑着，跑完 B站 那边会把挑到的推过来。"
+                "回一句你自己的话就行，别编结果、别说具体几条。"
+            )
+        if status == "gap":
+            where = "这一轮还在跑" if result.get("running") else "刚刷过一轮"
+            return f"没开刷：{where}。回一句你自己的话，别报具体秒数/分钟数。"
+        if status == "queued":
+            return "没开刷：B站 那边在冷却，没排着。回一句你自己的话，别报具体分钟数。"
+        if status == "busy":
+            return "没开刷：上一轮还在跑，没排着。回一句你自己的话，别报具体时间。"
+        return f"没开成：{result.get('reason') or '那边没给说法'}"
+
+    @staticmethod
+    def _attach_scroll_note(event: AstrMessageEvent, result: dict[str, Any]) -> None:
+        """把后台说明挂到这一次事件上，等 on_llm_request 时注入。"""
+
+        try:
+            event.bili_scroll_note = result  # type: ignore[attr-defined]
+        except Exception:  # noqa: BLE001
+            logger.info("[BiliBridge] 挂刷一轮说明失败（这一轮就按普通聊天回）")
+
+    def _already_reported(self, body: str, ttl: float = 1800.0) -> bool:
+        """这条私信里的视频，是不是刚在「刷完了」那条消息里已经报过一遍了。
+
+        一轮刷完会发两条消息：插件自己那条「刷完了，挑了 N 条」，和 B站 那边发给主人的
+        私信（被本插件转成「📬 B站 私信」）。私信要等下一轮轮询才到，晚几十秒——
+        看起来就像「又刷了一轮」。所以只要这批 BV 全都刚报过，就不再推第二遍。
+        """
+
+        marked_at, bvs = self._reported_bvs
+        if not bvs or time.time() - marked_at > ttl:
+            return False
+        found = bvs_in_order(body)
+        return bool(found) and all(bv in bvs for bv in found)
+
+    def _scroll_summary(self, before: set[str], verdict: str, timeout: int) -> str:
+        if verdict == "failed":
+            return (
+                "这一轮没跑起来 —— DSH 那边连进程都没起来。"
+                f"原因在 {self._duty_home() / 'duty.log'} 里，最后几行就有。"
+            )
+        if verdict == "timeout":
+            return (
+                f"刷了 {max(1, timeout // 60)} 分钟还没结束，先不等了。"
+                "它可能卡在「再搜一个关键词」的循环里，下一轮看报告吧。"
+            )
+        items = [
+            item
+            for item in parse_report_items(self._read_report_text())
+            if item["bv"] not in before
+        ]
+        if not items:
+            # 日报没落（模型漏调那个工具）⇒ 退回归档：那一份是同一轮必写的
+            items = [
+                item
+                for item in parse_digest_items(self._read_digest_text())
+                if item["bv"] not in before
+            ]
+        skip_keyword = self.cfg.str("skip_keyword", "跳过") or "跳过"
+        items = [item for item in items if skip_keyword not in (item.get("note") or "")]
+        if not items:
+            return "刷完了，这一轮没挑到新的（判重挡掉了，或者推荐流里没什么值得看的）。"
+        # 记下「刚报过这几条」：B站 那边同一轮的私信晚几十秒才到，转发时按这个去重，
+        # 别让人收到两遍（2026-11-05 老大看到「刷了两次」就是这两条消息）。
+        self._reported_bvs = (time.time(), {item["bv"] for item in items})
+        limit = max(1, self.cfg.int("scroll_report_max", 5))
+        lines = [f"刷完了，挑了 {len(items)} 条："]
+        for index, item in enumerate(items[:limit], 1):
+            lines.append(f"{index}. {item['title'] or item['bv']}")
+            detail = item.get("line") or item.get("why") or item.get("note") or ""
+            tag = f"[{item['tier']}] " if item.get("tier") else ""
+            if detail or tag:
+                lines.append(f"   {tag}{detail[:90]}".rstrip())
+            lines.append(f"   {item['link']}")
+        if len(items) > limit:
+            lines.append(f"（还有 {len(items) - limit} 条，问一句「今天刷到什么」我给你列全）")
+        return "\n".join(lines)
+
+    def _read_report_text(self) -> str:
+        try:
+            return self._report_path().read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            return ""
+
+    async def _report_scroll_round(
+        self, umo: str, before: set[str], mark: tuple[Path, int]
+    ) -> None:
+        """等这一轮跑完，然后把新挑到的几条发回原会话。
+
+        完成信号用 duty.log 里那行「刷B站结束」—— 宿主自己写的，比猜文件时间稳。
+        """
+
+        interval = max(2, self.cfg.int("scroll_poll_interval", 5))
+        timeout = max(120, self.cfg.int("scroll_wait_timeout", 900))
+        deadline = time.monotonic() + timeout
+        verdict = "timeout"
+        while time.monotonic() < deadline:
+            chunk = self._duty_log_since(mark)
+            if "刷B站结束" in chunk:
+                verdict = "done"
+                break
+            if "刷B站起不来" in chunk or "刷B站开跑失败" in chunk:
+                verdict = "failed"
+                break
+            await asyncio.sleep(interval)
+        # 报告是子进程退出后宿主才补写的，稍等一下再读，别抢在它前面
+        await asyncio.sleep(2)
+        if not self.cfg.bool("scroll_report", False):
+            # 不回报：结果走 B站 那条私信（转发过来就是同一批）。这里只记一笔日志。
+            logger.info("[BiliBridge] 刷一轮结束（%s），结果交给 B站 私信那条", verdict)
+            return
+        try:
+            text = self._scroll_summary(before, verdict, timeout)
+            await self.context.send_message(umo, MessageChain([Plain(text)]))
+            logger.info("[BiliBridge] 刷一轮结果已回报（%s）", verdict)
+        except Exception:  # noqa: BLE001
+            logger.exception("[BiliBridge] 刷一轮结果回报失败")
+
+    @filter.event_message_type(filter.EventMessageType.ALL, priority=195)
+    async def scroll_on_phrase(self, event: AstrMessageEvent):
+        """老大说「刷视频 / 刷B站 / 看视频」时，让刷B站真跑一轮。
+
+        为什么放在模型前面：这件事花的是账号额度、还要跑一两分钟，不该让模型
+        把它「理解」成一句闲聊、更不该让它自己决定刷不刷 —— 命中了就在这儿把事办了。
+
+        但**话不归插件说**：插件只把「后台发生了什么」挂到事件上（见 inject_scroll_note），
+        措辞交给模型，这样她开口还是她自己的口气，不是一句现成的客服模板。
+        例外：`scroll_ack` 填了值 ⇒ 说明使用者就想要固定那一句，那就更省事，直接回。
+        """
+
+        if not self.cfg.bool("scroll_enabled", True):
+            return
+        try:
+            text = str(event.message_str or "").strip()
+            if not is_scroll_request(text, self._scroll_extra_words()):
+                return
+            sender = str(getattr(event, "get_sender_id", lambda: "")() or "")
+            if self.cfg.bool("scroll_owner_only", True):
+                owners = self._owner_ids()
+                if owners and sender not in owners:
+                    logger.info(
+                        "[BiliBridge] 刷一轮口令来自白名单外（%s），忽略", sender or "?"
+                    )
+                    return
+            result = await self._start_scroll(event)
+            ack = self.cfg.str("scroll_ack", "")
+            if ack and result.get("started"):
+                yield event.plain_result(ack)
+                event.stop_event()
+            else:
+                self._attach_scroll_note(event, result)
+            logger.info(
+                "[BiliBridge] 口令触发刷一轮（%s，%s）：%s",
+                sender or "?",
+                result.get("status", "?"),
+                text,
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("[BiliBridge] 口令触发刷一轮失败，交回模型")
+
+    @filter.on_llm_request()
+    async def inject_scroll_note(self, event: AstrMessageEvent, req: ProviderRequest):
+        """把「刷视频」后台那件事的说明临时挂到这次请求上，让模型用自己的语气说。
+
+        同样只走 `extra_user_content_parts` 且标记临时：不碰 system_prompt（缓存前缀），
+        也不落进会话上下文 —— 说过就完了。
+        """
+
+        result = getattr(event, "bili_scroll_note", None)
+        if not isinstance(result, dict):
+            return
+        try:
+            setattr(event, "bili_scroll_note", None)
+        except Exception:  # noqa: BLE001
+            pass
+        if TextPart is None:
+            return
+        try:
+            part = TextPart(text=self._scroll_note_text(result))
+            for attr in ("make_as_temp", "mark_as_temp"):
+                marker = getattr(part, attr, None)
+                if callable(marker):
+                    try:
+                        marked = marker()
+                        if marked is not None:
+                            part = marked
+                    except Exception:  # noqa: BLE001
+                        pass
+                    break
+            req.extra_user_content_parts.append(part)
+            logger.info(
+                "[BiliBridge] 已把「刷一轮」的说明挂到本轮请求（%s）",
+                result.get("status", "?"),
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("[BiliBridge] 挂「刷一轮」说明失败")
+
+    @filter.llm_tool(name="bili_scroll_run")
+    async def bili_scroll_run(self, event: AstrMessageEvent) -> str:
+        """让「刷B站」立刻去刷一轮：它会去 B站 推荐流挑几条，一两分钟后把结果发到这个会话。
+
+        使用者说「去刷刷B站」「帮我看看视频」这类话、而口令处理器没接住时调用。
+        调用之后用**你自己的语气**回一句（比如嫌他催、或者说去看看），
+        不要等结果、更不要编结果——结果跑完会由插件另外发过来。
+
+        Args:
+            无（不需要参数）
+        """
+        result = await self._start_scroll(event)
+        return self._scroll_status_text(result)
+
     # ── 处理器 4：帮助、自检、开关、手动同步 ────────────────────────────────
     @filter.command("bili_dm")
     async def bili_dm(self, event: AstrMessageEvent):
@@ -1850,7 +2752,24 @@ class BiliBridgePlugin(Star):
             )
             lines.append(f"   方向 {direction}：{direction_text}")
 
-        # 6) 上一次同步到底怎么了
+        # 6) 「说一句就刷一轮」这条线：DSH 网关能不能连上（连不上说明 DSH 没开或端口变了）
+        if not self.cfg.bool("scroll_enabled", True):
+            lines.append(f"{bad} 「刷视频」口令是关的（scroll_enabled）")
+        else:
+            try:
+                address = await asyncio.to_thread(self._dsh_gateway)
+                lines.append(
+                    f"{ok} 「刷视频」口令可用：DSH 网关 {address}，"
+                    f"刷B站家目录 {self._duty_home()}"
+                )
+            except DshBridgeError as exc:
+                lines.append(f"{bad} 「刷视频」口令连不上：{exc}")
+                hint.append(
+                    "「刷视频」要让 DSH 开着，并且刷B站（dsh-bili-scroll）插件在里面"
+                    "装好、启用；端口是随机的，会自动找，找不到就手动填 dsh_gateway"
+                )
+
+        # 7) 上一次同步到底怎么了
         last = self._last_sync
         if last:
             mark = ok if last.get("ok") else bad
@@ -1870,6 +2789,7 @@ class BiliBridgePlugin(Star):
         else:
             lines.append("")
             lines.append("都齐了，问一句「今天刷到什么」试试。")
+            lines.append("想让它现在就去刷：直接说「刷视频」「刷B站」「看视频」。")
         yield event.plain_result("\n".join(lines))
 
     @filter.command("bili_help")
@@ -1884,6 +2804,9 @@ class BiliBridgePlugin(Star):
             "/bili_sync   —— 立刻同步一次 B站 挑选结果",
             "/bili_dm on|off|status —— 私信转发开关",
             "/bili_help   —— 就是这条",
+            "",
+            "口令（直接说话，不用带 /）：",
+            "· 刷视频 / 刷B站 / 看视频 —— 让她立刻去刷一轮（跑完把挑到的发回这个会话）",
             "",
             "自动行为：",
             f"· 每 {cfg.int('sync_interval', 600)} 秒把这一轮挑中的视频写进 AI 记忆",

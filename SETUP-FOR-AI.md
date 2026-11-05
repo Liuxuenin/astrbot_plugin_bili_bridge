@@ -108,7 +108,10 @@ bili asr status        # ready 必须为 true，ffmpeg / sherpa_onnx / vad_model
   "dm_owner_uid": "<收信方 B站 UID>",
   "dm_direction": "me",
   "dm_only_video": true,
-  "dm_poll_interval": 120
+  "dm_poll_interval": 120,
+
+  "scroll_enabled": true,
+  "scroll_owner_only": true
 }
 ```
 
@@ -155,6 +158,17 @@ bili asr status        # ready 必须为 true，ffmpeg / sherpa_onnx / vad_model
 5. **测「第一个视频讲了什么」**：应解析到最近推送清单里的第 1 条（日志有 `第 1 个 → BV...（来源 push）`），
    而不是记忆块里另一份排列的第 1 条。
 
+6. **测「刷视频」口令**（v0.5.0 起）：让用户在 QQ 私聊里直接说一句 **「刷视频」**（不带 `/`）。应该是：
+   - 她**用自己的口气**回一句（插件不塞台词：后台说明是临时注入给模型的，所以可能是「又来？」也可能是「行吧去看看」，都正常）；**也不该出现「还要等 170 秒」这种数字**——说明里明令禁止报时间，出现了就是模型没听话
+   - 日志出现 `[BiliBridge] 口令触发刷一轮（...，started）` 和 `已把「刷一轮」的说明挂到本轮请求（started）`；
+   - 大约 1~2 分钟后，**只有一条**结果消息：B站 那条私信被转发过来的「📬 B站 私信」（插件默认不再自己发一份）。
+   `/bili_doctor` 里还会多一行 **「「刷视频」口令可用：DSH 网关 127.0.0.1:xxxxx」** —— 那行 ❌ 就说明
+   DSH 没开，或者刷B站插件没在 DSH 里装好（口令走的就是它自己的接口）。
+
+   如果刚跑过一轮（`scroll_min_gap` 三分钟内），正确表现是：她回一句嫌你急的话，
+   日志里 `status=gap`、**没有** `刷一轮已开跑` —— 那就是挡住了，不是 bug。
+   而且**三分钟过了也不会自己补跑**：必须再喊一次才会跑（老大定的规矩）。
+
 ---
 
 ## 4. 已知坑（照着避）
@@ -168,6 +182,16 @@ bili asr status        # ready 必须为 true，ffmpeg / sherpa_onnx / vad_model
 | 改完配置没反应 | 没重启 AstrBot |
 | 「第几个视频」答错 | 0.4.1 起按「最近推送顺序」解析；确认 `dm-state.json` 里有 `pushBvs` |
 | `bili dm read` 报错 | bili-cli 没登录，或 UID 填的是登录号自己 |
+| 说「刷视频」回「刷不了：连不上 DSH…」 | DSH 没开（桌面版/`dsh web` 都算），或者它换了端口。用 `dsh_gateway` 手填 `127.0.0.1:<端口>` 兜底 |
+| 说「刷视频」能跑，但回报「没挑到新的」 | 多半是 DSH 那一轮自己没跑成。看 `~/.dsh/bili-duty/duty.log` 尾部 |
+| ⚠️ 刷B站那一轮「工具没挂上」（`unknown tool`、`Python was not found`） | **`~/.dsh/bili-duty/config.json` 被写成了带 BOM 的 UTF-8** ⇒ 插件里 `JSON.parse` 直接抛、整份配置退回默认值 ⇒ `pythonPath` 变回 `python` ⇒ B站 MCP 起不来。把文件头三个字节 `EF BB BF` 去掉（存成「UTF-8 无 BOM」）就好。2026-11-05 真机上就是这么坏的 |
+| 说「刷视频」回「刚刷过，再等 N 秒」 | 是我们自己那道闸（`scroll_min_gap`，默认 **180 秒**，从上一轮**开跑**算）。等它就对了，别当成 bug；**这三分钟里再喊也不会跑** |
+| 说「刷视频」回「这会儿在冷却，还得 N 分钟」 | 冷却没被绕过（`scroll_ignore_cooldown=false`，或者读不到刷B站的原冷却值时的保守处理）。这一轮就不跑；想立刻跑就打开那个开关，并确认 `GET /api/bili-duty/config` 能读到 `manualCooldownMin` |
+| 说「刷视频」回「上一轮还在跑」 | 有一轮真在跑（或另一个 DSH 宿主占着运行锁）。这一轮不跑，等他收尾再喊 |
+| 被拒之后过了一会儿**自己又跑了一轮** | 设计上不该发生：2026-11-05 起所有拒绝路径都不留定时器（以前 `busy`/`queued` 会 30 秒后自己补跑，已删）。真遇到就看 `duty.log` 那条「刷B站开跑」是谁触发的（`manual` = 人喊的；`window:xxx` = 刷B站自己的定时窗口） |
+| 一轮刷完收到**两遍**同样的视频 | 以前会：插件那条「刷完了」+ B站 私信被转发的「📬 B站 私信」（晚几十秒）。v0.5.0 起按 BV 去重，半小时内同一批不再重复推 |
+| ⚠️ 改完 `main.py`，面板上点「重启」却没生效（日志还是旧版本号、旧行号） | **面板那个重启是在同一个进程里重来**，`sys.modules` 里还是旧模块 ⇒ 改过的代码不会被重新读（2026-11-05 实测：16:41 重启后日志里仍是 0.4.2、`bili_scroll_run` 也没了）。要让改动能生效，必须**把整个 AstrBot 进程换掉**（杀进程再起，或跑一次 `QQBot-Launcher.ps1`），必要时顺手删掉插件目录下的 `__pycache__` |
+| 日报里**这一轮刚写的内容被删了** | dsh-bili-scroll ≤2.3.4 的 `writeRoundNotesToReport` 会从 `## 投递` 处整段截断，把模型追加在它后面的内容一起删掉。本插件不受影响（日报没有新条目时会退回读 `digest` 归档），要修就动那边：只摘掉旧的那一段，别从 `## 投递` 往后全切 |
 
 ---
 
@@ -176,3 +200,4 @@ bili asr status        # ready 必须为 true，ffmpeg / sherpa_onnx / vad_model
 1. B站 推的视频私信会自动转到 QQ（想关就把 `dm_forward_enabled` 关掉）
 2. 直接把 B站 视频链接/卡片发给她，她会拉字幕讲内容
 3. 问她「今天刷到什么」能拿到最近清单；问「第 N 个讲了什么」会讲对应那条
+4. 说一句「刷视频」/「刷B站」/「看视频」，她就去刷一轮，跑完把挑到的几条发回来

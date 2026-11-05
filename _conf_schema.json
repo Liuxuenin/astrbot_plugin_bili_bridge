@@ -189,5 +189,60 @@
     "type": "int",
     "description": "单次语音转写的超时秒数。默认 180。",
     "default": 180
+  },
+  "scroll_enabled": {
+    "type": "bool",
+    "description": "「刷视频」口令：在 QQ 上说一句「刷视频 / 刷B站 / 看视频」，就让 DSH 那边的刷B站立刻跑一轮。需要那份 DSH 开着、并且装了刷B站（dsh-bili-scroll）。",
+    "default": true
+  },
+  "scroll_owner_only": {
+    "type": "bool",
+    "description": "只认 owner_uids 里的人能触发「刷视频」（别人说这句会被忽略）。默认开——跑一轮要花账号额度。",
+    "default": true
+  },
+  "scroll_ignore_cooldown": {
+    "type": "bool",
+    "description": "刷B站「手动轮冷却」里也照跑：临时把它的 manualCooldownMin 改成 0、跑起来后立刻改回原值（走它的配置接口）。关掉就改成排队——等冷却结束自己开跑。",
+    "default": true
+  },
+  "scroll_min_gap": {
+    "type": "int",
+    "description": "两次「刷视频」之间至少隔多少秒（防连点烧额度）。拒绝就是拒绝：这段时间里再喊也不会跑，只会回你一句。",
+    "default": 180
+  },
+  "scroll_ack": {
+    "type": "string",
+    "description": "触发成功后立刻回的那句话。⭐ 留空（推荐）= 不替她说，把「已经去刷了」这件事交给模型，她自己用平时的口气说；填了 = 就固定回这一句。",
+    "default": ""
+  },
+  "scroll_report": {
+    "type": "bool",
+    "description": "跑完要不要由本插件再发一条「刷完了，挑了 N 条」。⭐ 默认关：结果走 B站 那条私推（私信转发会把它转过来），一条就够，别发两遍。",
+    "default": false
+  },
+  "scroll_report_max": {
+    "type": "int",
+    "description": "跑完最多报几条。",
+    "default": 5
+  },
+  "scroll_wait_timeout": {
+    "type": "int",
+    "description": "触发后最多等多久（秒）等她刷完再回报；超时就不等了。",
+    "default": 900
+  },
+  "scroll_poll_interval": {
+    "type": "int",
+    "description": "等她刷完时多久看一次进度（秒）。",
+    "default": 5
+  },
+  "scroll_extra_words": {
+    "type": "string",
+    "description": "额外的触发词，逗号分隔（例如：去溜溜,刷会儿）。默认那套「刷视频/刷B站/看视频」已经内置。",
+    "default": ""
+  },
+  "dsh_gateway": {
+    "type": "string",
+    "description": "DSH 网关地址（形如 127.0.0.1:63825）。留空会自动找——DSH 每次启动端口都可能变，所以默认别填。",
+    "default": ""
   }
 }

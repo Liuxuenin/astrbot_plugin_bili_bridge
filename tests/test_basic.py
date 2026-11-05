@@ -256,6 +256,126 @@ def test_parse_push_items_variable_count():
     print("ok  推送条数不固定（1/2/3 条）")
 
 
+def test_scroll_phrase():
+    """「刷视频」口令：该接的接住，问内容的不许抢。"""
+
+    hits = [
+        "刷视频",
+        "刷B站",
+        "刷b站",
+        "看视频",
+        "看一下视频",
+        "帮我刷一下B站",
+        "快去刷视频吧",
+        "去刷刷B站",
+        "刷一轮",
+    ]
+    hits += [
+        "请去刷一轮视频",      # 2026-11-05 真机漏掉的那句（前面挂个「请」）
+        "请帮我刷一轮视频",
+        "老大去刷视频",
+    ]
+    misses = [
+        "今天看了什么视频",
+        "B站今天刷到什么",
+        "这个视频讲什么",
+        "看视频吗",
+        "刷B站的评论",
+        "在吗",
+        "泡泡你好",
+        "刷视频 帮我看看有没有讲AI的",  # 太长 + 带疑问 ⇒ 交给模型
+        "我不想看视频",
+        "不用刷了",
+        "算了不刷了",
+    ]
+    for text in hits:
+        assert mod.is_scroll_request(text), text
+    for text in misses:
+        assert not mod.is_scroll_request(text), text
+    assert mod.is_scroll_request("去溜溜", ["去溜溜"]), "额外触发词要认"
+    print("ok  「刷视频」口令识别")
+
+
+def test_parse_report_items():
+    """日报里 `### BV…` 的几种写法都要能拆出来（带不带 `- ` 前缀都认）。"""
+
+    text = (
+        "# 刷B站日报 2026-11-05\n\n## 手动触发（追加）\n\n"
+        "### BV1KiJk67EQ9\n"
+        "- 标题：我造了一块会飞的滑板...\n"
+        "- UP：神奇阿宇Ayu ｜ 链接：https://www.bilibili.com/video/BV1KiJk67EQ9 ｜ 播放：832.9 万\n"
+        "- **档位**：值得看\n"
+        "- 为什么值得：真造了一台载人飞行滑板。\n"
+        "- 一句话：这条的信息量是「照着做一遍」级别的。\n\n"
+        "### BV1onxb6rEeE\n"
+        "标题：12个大模型扮演君主\n"
+        "**档位**：可以看\n"
+        "一句话：当故事看也值。\n"
+    )
+    items = mod.parse_report_items(text)
+    assert [i["bv"] for i in items] == ["BV1KiJk67EQ9", "BV1onxb6rEeE"], items
+    assert items[0]["title"].startswith("我造了一块"), items[0]
+    assert items[0]["tier"] == "值得看", items[0]
+    assert items[0]["link"] == "https://www.bilibili.com/video/BV1KiJk67EQ9", items[0]
+    assert items[1]["title"].startswith("12个大模型"), items[1]
+    assert items[1]["link"] == "https://www.bilibili.com/video/BV1onxb6rEeE", items[1]
+    assert mod.parse_report_items("") == []
+    print("ok  日报解析")
+
+
+def test_parse_digest_items():
+    """归档行（带档位 / 不带档位 / 跳过）都要能拆出来。"""
+
+    text = (
+        "- 2026-11-05 · BV1Rbxg6WER5 · 一个有自主意识的插件 · 玛露Marrow · "
+        "人格卡+记忆卡三端共用 · 值得看 · https://www.bilibili.com/video/BV1Rbxg6WER5\n"
+        "- 2026-11-05 · BV15sxS68EFq · 不看电视不接电话的中国人 · 汤山老王 · "
+        "跳过（22分钟口播、无字幕） · https://www.bilibili.com/video/BV15sxS68EFq\n"
+    )
+    items = mod.parse_digest_items(text)
+    assert len(items) == 2, items
+    assert items[0]["bv"] == "BV1Rbxg6WER5"
+    assert items[0]["tier"] == "值得看", items[0]
+    assert "人格卡" in items[0]["note"], items[0]
+    assert "跳过" in items[1]["note"], items[1]
+    assert items[1]["link"] == "https://www.bilibili.com/video/BV15sxS68EFq", items[1]
+    print("ok  归档行解析")
+
+
+def test_mint_dsh_cookie():
+    """签出来的 cookie 要能被人用同样的密钥验回来（格式：v1.<body>.<sig>）。"""
+
+    import base64
+    import hashlib
+    import hmac
+    import json
+
+    secret_b64 = base64.urlsafe_b64encode(b"0123456789abcdef0123456789abcdef").decode()
+    name, value = mod.mint_dsh_cookie("127.0.0.1:63825", secret_b64)
+    assert name.startswith("dsh-auth-"), name
+    expect = "dsh-auth-" + base64.urlsafe_b64encode(
+        hashlib.sha256(b"127.0.0.1:63825").digest()
+    ).decode().rstrip("=")
+    assert name == expect, (name, expect)
+
+    version, body, sig = value.split(".")
+    assert version == "v1"
+    payload = json.loads(
+        base64.urlsafe_b64decode(body + "=" * (-len(body) % 4)).decode("utf-8")
+    )
+    assert payload["authority"] == "127.0.0.1:63825", payload
+    assert payload["expiresAt"] > payload["issuedAt"], payload
+    mine = base64.urlsafe_b64encode(
+        hmac.new(
+            base64.urlsafe_b64decode(secret_b64 + "=" * (-len(secret_b64) % 4)),
+            body.encode("ascii"),
+            hashlib.sha256,
+        ).digest()
+    ).decode().rstrip("=")
+    assert sig == mine, "签名对不上"
+    print("ok  DSH cookie 签名")
+
+
 if __name__ == "__main__":
     test_row_parsing()
     test_select_picks_latest_and_fills()
@@ -269,4 +389,8 @@ if __name__ == "__main__":
     test_parse_push_items_variable_count()
     test_chunk_text()
     test_ask_regex()
+    test_scroll_phrase()
+    test_parse_report_items()
+    test_parse_digest_items()
+    test_mint_dsh_cookie()
     print("\n全部通过")
