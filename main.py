@@ -50,7 +50,7 @@ except Exception:  # noqa: BLE001
     TextPart = None  # type: ignore[assignment]
 
 PLUGIN_NAME = "astrbot_plugin_bili_bridge"
-PLUGIN_VERSION = "0.5.2"
+PLUGIN_VERSION = "0.5.4"
 
 MEMORY_PLUGIN_NAME = "astrbot_plugin_memory_companion"
 

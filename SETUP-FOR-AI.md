@@ -98,7 +98,7 @@ bili asr status        # ready 必须为 true，ffmpeg / sherpa_onnx / vad_model
 
 ```json
 {
-  "bili_executable": "<bili 的绝对路径，例如 C:\\Python312\\Scripts\\bili.exe>",
+  "bili_executable": "<bili 的绝对路径，例如 C:\\path\\to\\Scripts\\bili.exe>",
   "owner_uids": "<用户 QQ 号>",
   "memory_user_ids": "<同上>",
   "sync_enabled": true,
