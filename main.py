@@ -1756,6 +1756,15 @@ class BiliBridgePlugin(Star):
             text = collect_message_text(event)
             match = BV_RE.search(text)
             hint_line = ""
+            if not match and SHORT_RE.search(text):
+                # 纯文本里贴的是 b23.tv 短链：正文里没有 BV 号，
+                # 前面补正文那一步不一定生效（message_str 在部分版本里是只读的），
+                # 这里再解析一次兜底，否则注入直接被跳过、模型只剩个链接可猜。
+                resolved = await resolve_short_link(text)
+                found = BV_RE.search(resolved) if resolved else None
+                if found:
+                    match = found
+                    logger.info("[BiliBridge] 注入前兜底解析短链：%s", found.group(1))
             if not match:
                 # 没带 BV：也许是「第一个视频讲了什么」这种指代刚发的清单
                 bvid = self._resolve_ordinal(text)
